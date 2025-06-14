@@ -42,7 +42,7 @@ peft_mapping.PEFT_TYPE_TO_CONFIG_MAPPING.update({"FASTLORA": FastLoraConfig})
 peft_model.get_peft_model_state_dict = get_peft_model_state_dict
 peft_model.set_peft_model_state_dict = set_peft_model_state_dict
 
-from fastlora.eval_utils import fastlora_generate_adaptor
+from fastlora.eval_utils import fastlora_generate_adaptor, fastlora_conditional_generate
 from peft.config import PeftConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -111,20 +111,7 @@ class FastLoRAMetaICLEvaluator:
             demonstrations.append(demo)
         return "\n\n".join(demonstrations)
     
-    def generate_lora_weights(self, demonstrations: str):
-        """Generate LoRA weights from demonstration examples"""
-        logger.debug(f"Generating LoRA weights from demonstrations...")
-        
-        lora_weights = fastlora_generate_adaptor(
-            self.model, 
-            self.tokenizer, 
-            demonstrations,
-            merge_strategy=self.merge_strategy,
-            max_window_size=self.window_size,
-        )
-        
-        logger.debug(f"Generated {len(lora_weights)} LoRA weight tensors")
-        return lora_weights
+
     
     def compute_option_probability(self, input_text: str, option: str, lora_weights=None) -> float:
         """Compute probability of a specific option given input text"""
@@ -183,12 +170,20 @@ class FastLoRAMetaICLEvaluator:
         return probability
     
     def predict_with_lora(self, test_data: List[Dict], train_data: List[Dict]) -> List[str]:
-        """Make predictions using LoRA-adapted model"""
+        """Make predictions using LoRA-adapted model with generate_answer_fastlora approach"""
         
         # Generate LoRA weights from demonstrations
         if len(train_data) > 0:
             demonstrations = self.format_demonstrations(train_data)
-            lora_weights = self.generate_lora_weights(demonstrations)
+            logger.debug("Generating LoRA weights from demonstrations...")
+            lora_weights = fastlora_generate_adaptor(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                context_text=demonstrations,
+                merge_strategy=self.merge_strategy,
+                max_window_size=self.window_size
+            )
+            logger.debug(f"Generated {len(lora_weights)} LoRA weight tensors")
         else:
             lora_weights = None
         
@@ -196,24 +191,81 @@ class FastLoRAMetaICLEvaluator:
         
         for example in test_data:
             input_text = example['input']
-            options = example['options']
+            options = example.get('options', [])
             
-            # Compute probability for each option
-            option_probs = {}
-            for option in options:
-                prob = self.compute_option_probability(input_text, option, lora_weights)
-                option_probs[option] = prob
-            
-            # Select option with highest probability
-            best_option = max(option_probs.keys(), key=lambda x: option_probs[x])
-            predictions.append(best_option)
-            
-            logger.debug(f"Input: {input_text[:100]}...")
-            logger.debug(f"Options: {options}")
-            logger.debug(f"Probabilities: {option_probs}")
-            logger.debug(f"Predicted: {best_option}")
+            # If it's a classification task with options, use option selection
+            if options:
+                # For classification tasks, we'll generate text and match to closest option
+                try:
+                    # Generate answer using FastLoRA
+                    generated_answer = fastlora_conditional_generate(
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        input_text=input_text,
+                        mode="weights",
+                        lora_weights=lora_weights,
+                        use_chat=True,
+                        max_new_tokens=self.max_new_tokens,
+                        stop=self.stop
+                    )
+                    
+                    # Match generated answer to closest option
+                    best_option = self._match_to_option(generated_answer.strip(), options)
+                    predictions.append(best_option)
+                    
+                    logger.debug(f"Input: {input_text[:100]}...")
+                    logger.debug(f"Options: {options}")
+                    logger.debug(f"Generated: {generated_answer}")
+                    logger.debug(f"Matched to: {best_option}")
+                    
+                except Exception as e:
+                    logger.error(f"Error generating answer with FastLoRA: {e}")
+                    logger.error(traceback.format_exc())
+                    # Fallback to empty string
+                    predictions.append("")
+            else:
+                # For non-classification tasks, generate text directly
+                try:
+                    generated_answer = fastlora_conditional_generate(
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        input_text=input_text,
+                        mode="weights",
+                        lora_weights=lora_weights,
+                        use_chat=True,
+                        max_new_tokens=self.max_new_tokens,
+                        stop=self.stop
+                    )
+                    
+                    predictions.append(generated_answer.strip())
+                    
+                    logger.debug(f"Input: {input_text[:100]}...")
+                    logger.debug(f"Generated: {generated_answer}")
+                    
+                except Exception as e:
+                    logger.error(f"Error generating answer with FastLoRA: {e}")
+                    logger.error(traceback.format_exc())
+                    predictions.append("")
         
         return predictions
+    
+    def _match_to_option(self, generated_text: str, options: List[str]) -> str:
+        """Match generated text to the closest option"""
+        generated_lower = generated_text.lower().strip()
+        
+        # First try exact match
+        for option in options:
+            if generated_lower == option.lower().strip():
+                return option
+        
+        # Then try substring match
+        for option in options:
+            if generated_lower in option.lower() or option.lower() in generated_lower:
+                return option
+        
+        # If no match found, return the first option
+        logger.debug(f"No match found for '{generated_text}' in options {options}, defaulting to first option")
+        return options[0] if options else generated_text
     
     def predict_standard_icl(self, test_data: List[Dict], train_data: List[Dict]) -> List[str]:
         """Make predictions using standard in-context learning (demonstrations in prompt)"""
@@ -429,12 +481,13 @@ def main():
     logger.info(f"Evaluation complete. Results saved to {args.output_dir}")
 
 def compute_summary_statistics(results: List[Dict]) -> Dict:
-    """Compute summary statistics organized by method, k-shots, and individual tasks."""
+    """Compute summary statistics organized by method, k-shots, individual tasks, and task types."""
     
     summary = {
         'by_method': defaultdict(list),
         'by_k_shots': defaultdict(list),
-        'by_task': defaultdict(list)
+        'by_task': defaultdict(list),
+        'by_task_type': defaultdict(list)
     }
     
     # Group results
@@ -442,6 +495,8 @@ def compute_summary_statistics(results: List[Dict]) -> Dict:
         method = result['method']
         k = result['k_shots']
         task_name = result['task']
+        is_classification = result['is_classification']
+        task_type = 'classification' if is_classification else 'non_classification'
         accuracy = result['accuracy']
         
         # Group by method
@@ -454,6 +509,10 @@ def compute_summary_statistics(results: List[Dict]) -> Dict:
         # Group by method, task, and k
         method_task_k_key = f"{method}_{task_name}_k{k}"
         summary['by_task'][method_task_k_key].append(accuracy)
+        
+        # Group by task type, method, and k
+        task_type_method_k_key = f"{task_type}_{method}_k{k}"
+        summary['by_task_type'][task_type_method_k_key].append(accuracy)
     
     # Compute statistics for each group
     def compute_stats(acc_list):
@@ -466,7 +525,7 @@ def compute_summary_statistics(results: List[Dict]) -> Dict:
         }
     
     # Replace lists with summary stats
-    for group_key in ['by_method', 'by_k_shots', 'by_task']:
+    for group_key in ['by_method', 'by_k_shots', 'by_task', 'by_task_type']:
         for key, acc_list in summary[group_key].items():
             summary[group_key][key] = compute_stats(acc_list)
     
@@ -539,6 +598,34 @@ def print_summary(summary: Dict):
             if key in summary['by_k_shots']:
                 stats = summary['by_k_shots'][key]
                 print(f"  {method:10}: {stats['mean']:.3f} ± {stats['std']:.3f} (n={stats['count']})")
+    
+    # Print results by task type and k-shot
+    print("\nRESULTS BY TASK TYPE AND K-SHOT:")
+    print("-" * 50)
+    
+    task_types = ['classification', 'non_classification']
+    
+    for task_type in task_types:
+        print(f"\n{task_type.upper().replace('_', ' ')}:")
+        
+        # Create header
+        header = f"{'K-Shot':>8}"
+        for method in methods:
+            header += f"{method.upper():>12}"
+        print(header)
+        print("-" * len(header))
+        
+        # Print data for each k-shot
+        for k in k_values:
+            row = f"{k:>8}"
+            for method in methods:
+                key = f"{task_type}_{method}_k{k}"
+                if key in summary['by_task_type']:
+                    stats = summary['by_task_type'][key]
+                    row += f"{stats['mean']:12.3f}"
+                else:
+                    row += f"{'N/A':>12}"
+            print(row)
     
     # Print detailed breakdown
     print("\nDETAILED BREAKDOWN (METHOD x TASK x K-SHOT):")
