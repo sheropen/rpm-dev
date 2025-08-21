@@ -1,3 +1,6 @@
 [submodule "LongProc"]
 	path = LongProc
 	url = https://github.com/princeton-pli/LongProc.git
+[submodule "generative-adapter"]
+	path = generative-adapter
+	url = https://github.com/chentong0/generative-adapter.git
