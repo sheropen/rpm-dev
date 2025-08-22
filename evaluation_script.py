@@ -272,6 +272,75 @@ class CountdownEvaluator(TaskEvaluator):
         }
 
 
+class PathTraversalEvaluator(TaskEvaluator):
+    """Evaluator for path_traversal task"""
+    
+    def load_sample_content(self, sample: Dict[str, Any]) -> str:
+        """Load city context from sample"""
+        return sample.get('context_nl', '')
+    
+    def _format_prompts_with_sample(self, raw_prompts: str, sample: Dict[str, Any]) -> str:
+        """Format prompts with sample data for path_traversal task"""
+        # For path_traversal, the prompts don't need sample-specific formatting
+        # The prompts are generic instructions for path finding
+        return raw_prompts
+    
+    def format_input_prompt(self, sample: Dict[str, Any], content: str) -> str:
+        """Format input prompt with city context and route query"""
+        template = self.load_input_prompt_template()
+        
+        # Extract source and destination cities from question_nl
+        question_nl = sample.get('question_nl', '')
+        # # Parse "Please give a route from X to Y." format
+        # import re
+        # route_match = re.search(r'from (\w+(?:\s+\w+)*) to (\w+(?:\s+\w+)*)', question_nl)
+        # if route_match:
+        #     src_city = route_match.group(1).strip()
+        #     dst_city = route_match.group(2).strip()
+        # else:
+        #     src_city = "unknown"
+        #     dst_city = "unknown"
+        
+        return template.format(
+            city_context=content,
+            question_nl=question_nl
+        )
+    
+    def evaluate_output(self, generated_output: str, ground_truth: str, sample: Dict[str, Any]) -> Dict[str, Any]:
+        """Evaluate path traversal solution"""
+        # Extract route from generated output
+        route_match = re.search(r'<Route>(.*?)</Route>', generated_output, re.DOTALL)
+        if route_match:
+            extracted_route = route_match.group(1).strip()
+        else:
+            extracted_route = generated_output.strip()
+        
+        # Get ground truth route
+        gt_route = ground_truth.strip()
+        
+        # Count route steps
+        gt_steps = [line.strip() for line in gt_route.split('\n') if line.strip()]
+        gen_steps = [line.strip() for line in extracted_route.split('\n') if line.strip()]
+        
+        # Count steps
+        gt_step_count = len(gt_steps)
+        gen_step_count = len(gen_steps)
+        
+        # Check if route format is correct (starts with "From" and contains transit methods)
+        has_correct_format = all(
+            step.startswith('From ') and any(method in step for method in ['bus', 'train', 'plane', 'ferry'])
+            for step in gen_steps
+        )
+        
+        return {
+            'gt_step_count': gt_step_count,
+            'gen_step_count': gen_step_count,
+            'has_correct_format': has_correct_format,
+            'extracted_route': extracted_route,
+            'gt_route': gt_route
+        }
+
+
 class GenerativeAdapterEvaluator:
     """Main evaluator class that handles model loading and evaluation"""
     
@@ -484,6 +553,12 @@ def get_task_config(task_type: str) -> Dict[str, str]:
             "prompts_file": "prompts/countdown/prompts.yaml",
             "input_prompt_template_file": "prompts/countdown/input_prompt_template.yml",
             "data_dir": "LongProc/data/countdown"
+        },
+        "path_traversal": {
+            "dataset_file": "LongProc/data/path_traversal/path_traversal_0.5k.json",
+            "prompts_file": "prompts/path_traversal/prompts.yaml",
+            "input_prompt_template_file": "prompts/path_traversal/input_prompt_template.yaml",
+            "data_dir": "LongProc/data/path_traversal"
         }
     }
     
@@ -511,6 +586,13 @@ def create_task_evaluator(task_type: str, config: Dict[str, str]) -> TaskEvaluat
         )
     elif task_type == "countdown":
         return CountdownEvaluator(
+            task_type, 
+            config['data_dir'], 
+            config['prompts_file'], 
+            config['input_prompt_template_file']
+        )
+    elif task_type == "path_traversal":
+        return PathTraversalEvaluator(
             task_type, 
             config['data_dir'], 
             config['prompts_file'], 
@@ -571,7 +653,7 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate Generative Adapter on LongProc tasks')
     parser.add_argument('--task', type=str, 
                        default="pseudo_to_code",
-                       choices=["html_to_tsv", "pseudo_to_code", "countdown"],
+                       choices=["html_to_tsv", "pseudo_to_code", "countdown", "path_traversal"],
                        help='Task type to evaluate')
     parser.add_argument('--dataset', type=str, 
                        help='Path to dataset file (overrides task default)')
