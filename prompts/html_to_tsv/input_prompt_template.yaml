@@ -1,0 +1,5 @@
+INPUT_PROMPT: |-
+  [HTML CONTENT]
+  {html_str}
+
+  [TSV]:
