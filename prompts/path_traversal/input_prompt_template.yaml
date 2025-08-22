@@ -1,0 +1,6 @@
+INPUT_PROMPT: |-
+  [PROBLEM]
+  {city_context}
+
+  {question_nl}
+  Remember to use the output format you were given.
